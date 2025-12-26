@@ -68,8 +68,10 @@ echo.
 echo ========================================
 echo  Installation complete!
 echo.
-echo  The "Extract to folder" option will now
-echo  appear in the context menu for archives.
+echo  New context menu options:
+echo  - Archives: "Extract to folder"
+echo  - Files: "Zip to parent.zip"
+echo  - Folders: "Zip folder" / "Zip each separately"
 echo ========================================
 echo.
 pause

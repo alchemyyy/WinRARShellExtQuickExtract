@@ -1,8 +1,13 @@
 /*
- * WinRAR "Extract to Folder" Context Menu
- * 
- * Adds a flat "Extract to <folder>" option with dynamic naming that directly 
- * invokes WinRAR.exe. Reads supported extensions from WinRAR's registry.
+ * WinRAR Shell Extension
+ *
+ * Features:
+ * - "Extract to <folder>" for single archive files
+ * - "Zip to <parent>.zip" for multi-file/folder selections
+ * - "Zip each folder separately" for multi-folder selections
+ * - "Zip all folders to <parent>.zip" for multi-folder selections
+ *
+ * Reads supported extensions from WinRAR's registry.
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -33,6 +38,9 @@ static wchar_t g_WinRARPath[MAX_PATH] = L"C:\\Program Files\\WinRAR\\WinRAR.exe"
 #define MAX_EXTENSIONS 64
 static wchar_t g_ArchiveExtensions[MAX_EXTENSIONS][16];
 static int g_NumExtensions = 0;
+
+// Max items we can handle in a multi-selection
+#define MAX_SELECTED_ITEMS 256
 
 //=============================================================================
 // Read extensions from WinRAR's registry
@@ -181,16 +189,38 @@ static HBITMAP GetWinRARMenuBitmap(void)
 }
 
 //=============================================================================
+// Selection types
+//=============================================================================
+typedef enum {
+    SEL_NONE = 0,
+    SEL_SINGLE_ARCHIVE,      // Single archive file - show extract option
+    SEL_FILES_ONLY,          // Multiple files (no folders) - show zip to single archive
+    SEL_FOLDERS_ONLY,        // Multiple folders only - show zip each + zip all options
+    SEL_MIXED                // Files and folders mixed - show zip to single archive
+} SelectionType;
+
+//=============================================================================
 // Context Menu implementation
 //=============================================================================
 typedef struct {
     IContextMenu3 IContextMenu3_iface;
     IShellExtInit IShellExtInit_iface;
     LONG cRef;
+
+    // For single archive extraction
     wchar_t szFilePath[MAX_PATH];
     wchar_t szFolderName[MAX_PATH];
     wchar_t szDestFolder[MAX_PATH];
-    BOOL bIsArchive;
+
+    // For multi-selection operations
+    wchar_t (*szSelectedPaths)[MAX_PATH];  // Dynamically allocated array
+    UINT nSelectedCount;
+    UINT nFileCount;
+    UINT nFolderCount;
+    wchar_t szParentFolder[MAX_PATH];      // Parent folder for naming archives
+    wchar_t szParentName[MAX_PATH];        // Just the parent folder name
+
+    SelectionType selType;
 } ExtractContextMenu;
 
 static inline ExtractContextMenu* impl_from_IContextMenu3(IContextMenu3* iface) {
@@ -238,9 +268,13 @@ static ULONG STDMETHODCALLTYPE Menu_Release(IContextMenu3* This)
 {
     ExtractContextMenu* self = impl_from_IContextMenu3(This);
     ULONG cRef = InterlockedDecrement(&self->cRef);
-    
+
     if (cRef == 0)
     {
+        if (self->szSelectedPaths)
+        {
+            HeapFree(GetProcessHeap(), 0, self->szSelectedPaths);
+        }
         HeapFree(GetProcessHeap(), 0, self);
         InterlockedDecrement(&g_cRef);
     }
@@ -250,27 +284,16 @@ static ULONG STDMETHODCALLTYPE Menu_Release(IContextMenu3* This)
 //=============================================================================
 // IContextMenu
 //=============================================================================
-#define IDM_EXTRACT 0
+#define IDM_EXTRACT             0
+#define IDM_ZIP_TO_SINGLE       1
+#define IDM_ZIP_EACH_FOLDER     2
+#define IDM_ZIP_ALL_FOLDERS     3
 
-static HRESULT STDMETHODCALLTYPE Menu_QueryContextMenu(
-    IContextMenu3* This, HMENU hmenu, UINT indexMenu, UINT idCmdFirst, UINT idCmdLast, UINT uFlags)
+// Find WinRAR's menu position to insert after it
+static UINT FindWinRARMenuPosition(HMENU hmenu, UINT defaultPos)
 {
-    ExtractContextMenu* self = impl_from_IContextMenu3(This);
-    
-    if (!self->bIsArchive)
-        return MAKE_HRESULT(SEVERITY_SUCCESS, 0, 0);
-    
-    if (uFlags & CMF_DEFAULTONLY)
-        return MAKE_HRESULT(SEVERITY_SUCCESS, 0, 0);
-    
-    // Build menu text with dynamic folder name
-    wchar_t menuText[MAX_PATH + 32];
-    StringCchPrintfW(menuText, ARRAYSIZE(menuText), L"Extract to \"%s\\\"", self->szFolderName);
-    
-    // Find WinRAR's position and insert right after it
-    UINT insertPos = indexMenu;
     int itemCount = GetMenuItemCount(hmenu);
-    
+
     for (int i = 0; i < itemCount; i++)
     {
         wchar_t itemText[256] = {0};
@@ -279,93 +302,300 @@ static HRESULT STDMETHODCALLTYPE Menu_QueryContextMenu(
         miiCheck.fMask = MIIM_STRING | MIIM_SUBMENU;
         miiCheck.dwTypeData = itemText;
         miiCheck.cch = ARRAYSIZE(itemText);
-        
+
         if (GetMenuItemInfoW(hmenu, i, TRUE, &miiCheck))
         {
             if (wcsstr(itemText, L"WinRAR") != NULL)
             {
-                insertPos = i + 1;
-                break;
+                return i + 1;
             }
         }
     }
-    
-    // Insert menu item with icon
+    return defaultPos;
+}
+
+static HRESULT STDMETHODCALLTYPE Menu_QueryContextMenu(
+    IContextMenu3* This, HMENU hmenu, UINT indexMenu, UINT idCmdFirst, UINT idCmdLast, UINT uFlags)
+{
+    ExtractContextMenu* self = impl_from_IContextMenu3(This);
+    UINT cmdCount = 0;
+
+    if (self->selType == SEL_NONE)
+        return MAKE_HRESULT(SEVERITY_SUCCESS, 0, 0);
+
+    if (uFlags & CMF_DEFAULTONLY)
+        return MAKE_HRESULT(SEVERITY_SUCCESS, 0, 0);
+
+    UINT insertPos = FindWinRARMenuPosition(hmenu, indexMenu);
+    wchar_t menuText[MAX_PATH + 64];
     MENUITEMINFOW mii = {0};
     mii.cbSize = sizeof(mii);
     mii.fMask = MIIM_STRING | MIIM_ID | MIIM_STATE | MIIM_BITMAP;
-    mii.wID = idCmdFirst + IDM_EXTRACT;
-    mii.dwTypeData = menuText;
     mii.fState = MFS_ENABLED;
     mii.hbmpItem = GetWinRARMenuBitmap();
-    
-    InsertMenuItemW(hmenu, insertPos, TRUE, &mii);
-    
-    return MAKE_HRESULT(SEVERITY_SUCCESS, 0, IDM_EXTRACT + 1);
+
+    switch (self->selType)
+    {
+    case SEL_SINGLE_ARCHIVE:
+        // Original extract functionality
+        StringCchPrintfW(menuText, ARRAYSIZE(menuText), L"Extract to \"%s\\\"", self->szFolderName);
+        mii.wID = idCmdFirst + IDM_EXTRACT;
+        mii.dwTypeData = menuText;
+        InsertMenuItemW(hmenu, insertPos, TRUE, &mii);
+        cmdCount = IDM_EXTRACT + 1;
+        break;
+
+    case SEL_FILES_ONLY:
+    case SEL_MIXED:
+        // Zip all selected items to a single archive named after parent folder
+        StringCchPrintfW(menuText, ARRAYSIZE(menuText), L"Zip to \"%s.zip\"", self->szParentName);
+        mii.wID = idCmdFirst + IDM_ZIP_TO_SINGLE;
+        mii.dwTypeData = menuText;
+        InsertMenuItemW(hmenu, insertPos, TRUE, &mii);
+        cmdCount = IDM_ZIP_TO_SINGLE + 1;
+        break;
+
+    case SEL_FOLDERS_ONLY:
+        // Option 1: Zip each folder to its own archive
+        if (self->nFolderCount > 1)
+        {
+            StringCchPrintfW(menuText, ARRAYSIZE(menuText), L"Zip each folder separately (%u folders)", self->nFolderCount);
+        }
+        else
+        {
+            // Single folder - show the folder name
+            wchar_t* folderName = PathFindFileNameW(self->szSelectedPaths[0]);
+            StringCchPrintfW(menuText, ARRAYSIZE(menuText), L"Zip \"%s\"", folderName);
+        }
+        mii.wID = idCmdFirst + IDM_ZIP_EACH_FOLDER;
+        mii.dwTypeData = menuText;
+        InsertMenuItemW(hmenu, insertPos, TRUE, &mii);
+
+        // Option 2: Zip all folders to single archive (only if multiple folders)
+        if (self->nFolderCount > 1)
+        {
+            StringCchPrintfW(menuText, ARRAYSIZE(menuText), L"Zip all to \"%s.zip\"", self->szParentName);
+            mii.wID = idCmdFirst + IDM_ZIP_ALL_FOLDERS;
+            mii.dwTypeData = menuText;
+            InsertMenuItemW(hmenu, insertPos + 1, TRUE, &mii);
+            cmdCount = IDM_ZIP_ALL_FOLDERS + 1;
+        }
+        else
+        {
+            cmdCount = IDM_ZIP_EACH_FOLDER + 1;
+        }
+        break;
+
+    default:
+        return MAKE_HRESULT(SEVERITY_SUCCESS, 0, 0);
+    }
+
+    return MAKE_HRESULT(SEVERITY_SUCCESS, 0, cmdCount);
+}
+
+// Execute WinRAR with the given command line (non-blocking, shows progress window)
+static BOOL ExecuteWinRAR(const wchar_t* cmdLine)
+{
+    STARTUPINFOW si = {0};
+    PROCESS_INFORMATION pi = {0};
+    si.cb = sizeof(si);
+
+    // Need a mutable copy of cmdLine for CreateProcessW
+    size_t len = wcslen(cmdLine) + 1;
+    wchar_t* mutableCmd = HeapAlloc(GetProcessHeap(), 0, len * sizeof(wchar_t));
+    if (!mutableCmd) return FALSE;
+    wcscpy_s(mutableCmd, len, cmdLine);
+
+    BOOL result = CreateProcessW(NULL, mutableCmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi);
+
+    HeapFree(GetProcessHeap(), 0, mutableCmd);
+
+    if (result)
+    {
+        // Don't wait - let WinRAR run independently with its progress window
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
+    return result;
+}
+
+// Create a temporary list file for WinRAR with all paths
+static BOOL CreateListFile(const wchar_t* listPath, wchar_t (*paths)[MAX_PATH], UINT count)
+{
+    HANDLE hFile = CreateFileW(listPath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                               FILE_ATTRIBUTE_TEMPORARY, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return FALSE;
+
+    // Write BOM for Unicode
+    BYTE bom[] = {0xFF, 0xFE};
+    DWORD written;
+    WriteFile(hFile, bom, sizeof(bom), &written, NULL);
+
+    for (UINT i = 0; i < count; i++)
+    {
+        WriteFile(hFile, paths[i], (DWORD)(wcslen(paths[i]) * sizeof(wchar_t)), &written, NULL);
+        WriteFile(hFile, L"\r\n", 4, &written, NULL);
+    }
+
+    CloseHandle(hFile);
+    return TRUE;
 }
 
 static HRESULT STDMETHODCALLTYPE Menu_InvokeCommand(
     IContextMenu3* This, CMINVOKECOMMANDINFO* pici)
 {
     ExtractContextMenu* self = impl_from_IContextMenu3(This);
-    
+
     if (HIWORD(pici->lpVerb) != 0)
         return E_INVALIDARG;
-    
-    if (LOWORD(pici->lpVerb) != IDM_EXTRACT)
-        return E_INVALIDARG;
-    
-    // Create destination folder first
-    CreateDirectoryW(self->szDestFolder, NULL);
-    
-    // Build command line: WinRAR.exe x -ibck "<archive>" "<dest folder>\"
-    wchar_t cmdLine[MAX_PATH * 3];
-    StringCchPrintfW(cmdLine, ARRAYSIZE(cmdLine), 
-        L"\"%s\" x -ibck \"%s\" \"%s\\\"",
-        g_WinRARPath, self->szFilePath, self->szDestFolder);
-    
-    // Execute WinRAR
-    STARTUPINFOW si = {0};
-    PROCESS_INFORMATION pi = {0};
-    si.cb = sizeof(si);
-    
-    if (CreateProcessW(NULL, cmdLine, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi))
+
+    UINT cmd = LOWORD(pici->lpVerb);
+    wchar_t cmdLine[32768];  // Large buffer for multiple file paths
+    wchar_t archivePath[MAX_PATH];
+    wchar_t listFilePath[MAX_PATH];
+
+    switch (cmd)
     {
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
+    case IDM_EXTRACT:
+        // Original extract functionality
+        CreateDirectoryW(self->szDestFolder, NULL);
+        StringCchPrintfW(cmdLine, ARRAYSIZE(cmdLine),
+            L"\"%s\" x \"%s\" \"%s\\\"",
+            g_WinRARPath, self->szFilePath, self->szDestFolder);
+        break;
+
+    case IDM_ZIP_TO_SINGLE:
+        // Zip all selected files/folders to a single archive named after parent folder
+        StringCchPrintfW(archivePath, ARRAYSIZE(archivePath),
+            L"%s\\%s.zip", self->szParentFolder, self->szParentName);
+
+        // Create temp list file
+        GetTempPathW(MAX_PATH, listFilePath);
+        StringCchCatW(listFilePath, MAX_PATH, L"winrar_files.lst");
+
+        if (!CreateListFile(listFilePath, self->szSelectedPaths, self->nSelectedCount))
+            return E_FAIL;
+
+        // Use -r for recursion (in case folders are selected), -ep1 to keep relative paths
+        StringCchPrintfW(cmdLine, ARRAYSIZE(cmdLine),
+            L"\"%s\" a -afzip -r -ep1 \"%s\" @\"%s\"",
+            g_WinRARPath, archivePath, listFilePath);
+        break;
+
+    case IDM_ZIP_EACH_FOLDER:
+        // Zip each folder to its own archive concurrently (non-blocking)
+        // Each folder's contents go to root of archive (no double folder)
+        for (UINT i = 0; i < self->nSelectedCount; i++)
+        {
+            wchar_t folderPath[MAX_PATH];
+            StringCchCopyW(folderPath, MAX_PATH, self->szSelectedPaths[i]);
+
+            // Get folder name for archive name
+            wchar_t* folderName = PathFindFileNameW(folderPath);
+            wchar_t parentDir[MAX_PATH];
+            StringCchCopyW(parentDir, MAX_PATH, folderPath);
+            PathRemoveFileSpecW(parentDir);
+
+            StringCchPrintfW(archivePath, ARRAYSIZE(archivePath),
+                L"%s\\%s.zip", parentDir, folderName);
+
+            // Use -r for recursion, -ep1 to exclude base folder path
+            StringCchPrintfW(cmdLine, ARRAYSIZE(cmdLine),
+                L"\"%s\" a -afzip -r -ep1 \"%s\" \"%s\\*\"",
+                g_WinRARPath, archivePath, folderPath);
+
+            ExecuteWinRAR(cmdLine);
+        }
         return S_OK;
+
+    case IDM_ZIP_ALL_FOLDERS:
+        // Zip all folders to a single archive
+        StringCchPrintfW(archivePath, ARRAYSIZE(archivePath),
+            L"%s\\%s.zip", self->szParentFolder, self->szParentName);
+
+        // Create temp list file
+        GetTempPathW(MAX_PATH, listFilePath);
+        StringCchCatW(listFilePath, MAX_PATH, L"winrar_folders.lst");
+
+        if (!CreateListFile(listFilePath, self->szSelectedPaths, self->nSelectedCount))
+            return E_FAIL;
+
+        // Use -r for recursion, -ep1 to strip parent path but keep folder names
+        // Result: FolderA/contents, FolderB/contents in archive
+        StringCchPrintfW(cmdLine, ARRAYSIZE(cmdLine),
+            L"\"%s\" a -afzip -r -ep1 \"%s\" @\"%s\"",
+            g_WinRARPath, archivePath, listFilePath);
+        break;
+
+    default:
+        return E_INVALIDARG;
     }
-    
-    return E_FAIL;
+
+    if (!ExecuteWinRAR(cmdLine))
+        return E_FAIL;
+
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE Menu_GetCommandString(
     IContextMenu3* This, UINT_PTR idCmd, UINT uType, UINT* pReserved, LPSTR pszName, UINT cchMax)
 {
-    if (idCmd != IDM_EXTRACT)
+    const wchar_t* helpTextW = NULL;
+    const char* helpTextA = NULL;
+    const wchar_t* verbW = NULL;
+    const char* verbA = NULL;
+
+    switch (idCmd)
+    {
+    case IDM_EXTRACT:
+        helpTextW = L"Extract archive to folder";
+        helpTextA = "Extract archive to folder";
+        verbW = L"WinRARExtractTo";
+        verbA = "WinRARExtractTo";
+        break;
+    case IDM_ZIP_TO_SINGLE:
+        helpTextW = L"Zip selected items to archive";
+        helpTextA = "Zip selected items to archive";
+        verbW = L"WinRARZipToSingle";
+        verbA = "WinRARZipToSingle";
+        break;
+    case IDM_ZIP_EACH_FOLDER:
+        helpTextW = L"Zip each folder to its own archive";
+        helpTextA = "Zip each folder to its own archive";
+        verbW = L"WinRARZipEachFolder";
+        verbA = "WinRARZipEachFolder";
+        break;
+    case IDM_ZIP_ALL_FOLDERS:
+        helpTextW = L"Zip all folders to single archive";
+        helpTextA = "Zip all folders to single archive";
+        verbW = L"WinRARZipAllFolders";
+        verbA = "WinRARZipAllFolders";
+        break;
+    default:
         return E_INVALIDARG;
-    
+    }
+
     if (uType == GCS_HELPTEXTW)
     {
-        StringCchCopyW((LPWSTR)pszName, cchMax, L"Extract archive to folder");
+        StringCchCopyW((LPWSTR)pszName, cchMax, helpTextW);
         return S_OK;
     }
     else if (uType == GCS_HELPTEXTA)
     {
-        StringCchCopyA(pszName, cchMax, "Extract archive to folder");
+        StringCchCopyA(pszName, cchMax, helpTextA);
         return S_OK;
     }
     else if (uType == GCS_VERBW)
     {
-        StringCchCopyW((LPWSTR)pszName, cchMax, L"WinRARExtractTo");
+        StringCchCopyW((LPWSTR)pszName, cchMax, verbW);
         return S_OK;
     }
     else if (uType == GCS_VERBA)
     {
-        StringCchCopyA(pszName, cchMax, "WinRARExtractTo");
+        StringCchCopyA(pszName, cchMax, verbA);
         return S_OK;
     }
-    
+
     return E_INVALIDARG;
 }
 
@@ -421,37 +651,129 @@ static HRESULT STDMETHODCALLTYPE Init_Initialize(
     IShellExtInit* This, PCIDLIST_ABSOLUTE pidlFolder, IDataObject* pdtobj, HKEY hkeyProgID)
 {
     ExtractContextMenu* self = impl_from_IShellExtInit(This);
-    
+
     if (!pdtobj) return E_INVALIDARG;
-    
+
     FORMATETC fmt = { CF_HDROP, NULL, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
     STGMEDIUM stg = {0};
-    
+
     HRESULT hr = IDataObject_GetData(pdtobj, &fmt, &stg);
     if (FAILED(hr)) return hr;
-    
+
     UINT nFiles = DragQueryFileW((HDROP)stg.hGlobal, 0xFFFFFFFF, NULL, 0);
-    if (nFiles > 0)
+    if (nFiles == 0)
     {
-        DragQueryFileW((HDROP)stg.hGlobal, 0, self->szFilePath, MAX_PATH);
-        
-        self->bIsArchive = IsArchiveFile(self->szFilePath);
-        
-        if (self->bIsArchive)
+        ReleaseStgMedium(&stg);
+        self->selType = SEL_NONE;
+        return S_OK;
+    }
+
+    // Get first file path for parent folder detection
+    wchar_t firstPath[MAX_PATH];
+    DragQueryFileW((HDROP)stg.hGlobal, 0, firstPath, MAX_PATH);
+
+    // Get parent folder
+    StringCchCopyW(self->szParentFolder, MAX_PATH, firstPath);
+    PathRemoveFileSpecW(self->szParentFolder);
+
+    // Get parent folder name
+    wchar_t* parentName = PathFindFileNameW(self->szParentFolder);
+    StringCchCopyW(self->szParentName, MAX_PATH, parentName);
+
+    // Single file case - check for archive extraction
+    if (nFiles == 1)
+    {
+        StringCchCopyW(self->szFilePath, MAX_PATH, firstPath);
+
+        if (IsArchiveFile(firstPath))
         {
+            self->selType = SEL_SINGLE_ARCHIVE;
+
             // Extract folder name from filename (without extension)
             wchar_t* fileName = PathFindFileNameW(self->szFilePath);
             StringCchCopyW(self->szFolderName, MAX_PATH, fileName);
             PathRemoveExtensionW(self->szFolderName);
-            
+
             // Build full destination path: parent folder + archive name (no ext)
             StringCchCopyW(self->szDestFolder, MAX_PATH, self->szFilePath);
             PathRemoveFileSpecW(self->szDestFolder);
             PathAppendW(self->szDestFolder, self->szFolderName);
         }
+        else if (PathIsDirectoryW(firstPath))
+        {
+            // Single folder - treat as folders only
+            self->selType = SEL_FOLDERS_ONLY;
+            self->nFolderCount = 1;
+            self->nFileCount = 0;
+            self->nSelectedCount = 1;
+
+            self->szSelectedPaths = HeapAlloc(GetProcessHeap(), 0, sizeof(wchar_t[MAX_PATH]));
+            if (self->szSelectedPaths)
+            {
+                StringCchCopyW(self->szSelectedPaths[0], MAX_PATH, firstPath);
+            }
+        }
+        else
+        {
+            // Single non-archive file - no menu
+            self->selType = SEL_NONE;
+        }
+
+        ReleaseStgMedium(&stg);
+        return S_OK;
     }
-    
+
+    // Multiple files selected - allocate storage and count types
+    UINT maxItems = (nFiles > MAX_SELECTED_ITEMS) ? MAX_SELECTED_ITEMS : nFiles;
+    self->szSelectedPaths = HeapAlloc(GetProcessHeap(), 0, maxItems * sizeof(wchar_t[MAX_PATH]));
+    if (!self->szSelectedPaths)
+    {
+        ReleaseStgMedium(&stg);
+        return E_OUTOFMEMORY;
+    }
+
+    self->nFileCount = 0;
+    self->nFolderCount = 0;
+    self->nSelectedCount = 0;
+
+    for (UINT i = 0; i < maxItems; i++)
+    {
+        wchar_t path[MAX_PATH];
+        DragQueryFileW((HDROP)stg.hGlobal, i, path, MAX_PATH);
+
+        StringCchCopyW(self->szSelectedPaths[self->nSelectedCount], MAX_PATH, path);
+        self->nSelectedCount++;
+
+        if (PathIsDirectoryW(path))
+        {
+            self->nFolderCount++;
+        }
+        else
+        {
+            self->nFileCount++;
+        }
+    }
+
     ReleaseStgMedium(&stg);
+
+    // Determine selection type
+    if (self->nFileCount > 0 && self->nFolderCount == 0)
+    {
+        self->selType = SEL_FILES_ONLY;
+    }
+    else if (self->nFolderCount > 0 && self->nFileCount == 0)
+    {
+        self->selType = SEL_FOLDERS_ONLY;
+    }
+    else if (self->nFileCount > 0 && self->nFolderCount > 0)
+    {
+        self->selType = SEL_MIXED;
+    }
+    else
+    {
+        self->selType = SEL_NONE;
+    }
+
     return S_OK;
 }
 
@@ -495,23 +817,27 @@ static HRESULT STDMETHODCALLTYPE Factory_CreateInstance(
     IClassFactory* This, IUnknown* pUnkOuter, REFIID riid, void** ppv)
 {
     ExtractContextMenu* pMenu;
-    
+
     *ppv = NULL;
     if (pUnkOuter) return CLASS_E_NOAGGREGATION;
-    
+
     pMenu = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(ExtractContextMenu));
     if (!pMenu) return E_OUTOFMEMORY;
-    
+
     pMenu->IContextMenu3_iface.lpVtbl = &MenuVtbl;
     pMenu->IShellExtInit_iface.lpVtbl = &InitVtbl;
     pMenu->cRef = 1;
-    pMenu->bIsArchive = FALSE;
-    
+    pMenu->selType = SEL_NONE;
+    pMenu->szSelectedPaths = NULL;
+    pMenu->nSelectedCount = 0;
+    pMenu->nFileCount = 0;
+    pMenu->nFolderCount = 0;
+
     InterlockedIncrement(&g_cRef);
-    
+
     HRESULT hr = Menu_QueryInterface(&pMenu->IContextMenu3_iface, riid, ppv);
     Menu_Release(&pMenu->IContextMenu3_iface);
-    
+
     return hr;
 }
 
@@ -580,23 +906,23 @@ HRESULT STDAPICALLTYPE DllRegisterServer(void)
     wchar_t dllPath[MAX_PATH];
     HKEY hKey;
     LSTATUS status;
-    
+
     GetModuleFileNameW(g_hModule, dllPath, MAX_PATH);
-    
+
     // Reload extensions to make sure we have the latest
     LoadArchiveExtensions();
-    
+
     // Register CLSID
-    status = RegCreateKeyExW(HKEY_LOCAL_MACHINE, 
+    status = RegCreateKeyExW(HKEY_LOCAL_MACHINE,
         L"SOFTWARE\\Classes\\CLSID\\{A1B2C3D4-1234-5678-9ABC-DEF012345678}",
         0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL);
     if (status == ERROR_SUCCESS)
     {
-        RegSetValueExW(hKey, NULL, 0, REG_SZ, (LPBYTE)L"WinRAR Extract To Folder", 
-                       sizeof(L"WinRAR Extract To Folder"));
+        RegSetValueExW(hKey, NULL, 0, REG_SZ, (LPBYTE)L"WinRAR Shell Extension",
+                       sizeof(L"WinRAR Shell Extension"));
         RegCloseKey(hKey);
     }
-    
+
     status = RegCreateKeyExW(HKEY_LOCAL_MACHINE,
         L"SOFTWARE\\Classes\\CLSID\\{A1B2C3D4-1234-5678-9ABC-DEF012345678}\\InProcServer32",
         0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL);
@@ -606,62 +932,98 @@ HRESULT STDAPICALLTYPE DllRegisterServer(void)
         RegSetValueExW(hKey, L"ThreadingModel", 0, REG_SZ, (LPBYTE)L"Apartment", sizeof(L"Apartment"));
         RegCloseKey(hKey);
     }
-    
+
     // Register as ContextMenuHandler for each archive type from WinRAR's registry
     for (int i = 0; i < g_NumExtensions; i++)
     {
         wchar_t keyPath[256];
-        StringCchPrintfW(keyPath, ARRAYSIZE(keyPath), 
-            L"SOFTWARE\\Classes\\SystemFileAssociations\\%s\\shellex\\ContextMenuHandlers\\WinRARExtractTo",
+        StringCchPrintfW(keyPath, ARRAYSIZE(keyPath),
+            L"SOFTWARE\\Classes\\SystemFileAssociations\\%s\\shellex\\ContextMenuHandlers\\WinRARShellExt",
             g_ArchiveExtensions[i]);
-        
+
         status = RegCreateKeyExW(HKEY_LOCAL_MACHINE, keyPath, 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL);
         if (status == ERROR_SUCCESS)
         {
-            RegSetValueExW(hKey, NULL, 0, REG_SZ, 
-                           (LPBYTE)L"{A1B2C3D4-1234-5678-9ABC-DEF012345678}", 
+            RegSetValueExW(hKey, NULL, 0, REG_SZ,
+                           (LPBYTE)L"{A1B2C3D4-1234-5678-9ABC-DEF012345678}",
                            sizeof(L"{A1B2C3D4-1234-5678-9ABC-DEF012345678}"));
             RegCloseKey(hKey);
         }
     }
-    
+
+    // Register for all files (for multi-file zip operations)
+    status = RegCreateKeyExW(HKEY_LOCAL_MACHINE,
+        L"SOFTWARE\\Classes\\*\\shellex\\ContextMenuHandlers\\WinRARShellExt",
+        0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL);
+    if (status == ERROR_SUCCESS)
+    {
+        RegSetValueExW(hKey, NULL, 0, REG_SZ,
+                       (LPBYTE)L"{A1B2C3D4-1234-5678-9ABC-DEF012345678}",
+                       sizeof(L"{A1B2C3D4-1234-5678-9ABC-DEF012345678}"));
+        RegCloseKey(hKey);
+    }
+
+    // Register for directories (for folder zip operations)
+    status = RegCreateKeyExW(HKEY_LOCAL_MACHINE,
+        L"SOFTWARE\\Classes\\Directory\\shellex\\ContextMenuHandlers\\WinRARShellExt",
+        0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL);
+    if (status == ERROR_SUCCESS)
+    {
+        RegSetValueExW(hKey, NULL, 0, REG_SZ,
+                       (LPBYTE)L"{A1B2C3D4-1234-5678-9ABC-DEF012345678}",
+                       sizeof(L"{A1B2C3D4-1234-5678-9ABC-DEF012345678}"));
+        RegCloseKey(hKey);
+    }
+
     // Clean up old registrations
     RegDeleteKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Classes\\*\\shellex\\ContextMenuHandlers\\WinRAR~ExtractTo");
     RegDeleteKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Classes\\*\\shellex\\ContextMenuHandlers\\WinRARExtractTo");
     RegDeleteKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Classes\\*\\shellex\\ContextMenuHandlers\\~~~WinRARFlat");
     RegDeleteKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Classes\\*\\shellex\\ContextMenuHandlers\\WinRARFlat");
-    
+
     SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, NULL, NULL);
-    
+
     return S_OK;
 }
 
 HRESULT STDAPICALLTYPE DllUnregisterServer(void)
 {
     // Remove CLSID
-    RegDeleteTreeW(HKEY_LOCAL_MACHINE, 
+    RegDeleteTreeW(HKEY_LOCAL_MACHINE,
         L"SOFTWARE\\Classes\\CLSID\\{A1B2C3D4-1234-5678-9ABC-DEF012345678}");
-    
+
     // Reload extensions to clean up all registrations
     LoadArchiveExtensions();
-    
+
     // Remove ContextMenuHandler registrations for each archive type
     for (int i = 0; i < g_NumExtensions; i++)
     {
         wchar_t keyPath[256];
-        StringCchPrintfW(keyPath, ARRAYSIZE(keyPath), 
+        StringCchPrintfW(keyPath, ARRAYSIZE(keyPath),
+            L"SOFTWARE\\Classes\\SystemFileAssociations\\%s\\shellex\\ContextMenuHandlers\\WinRARShellExt",
+            g_ArchiveExtensions[i]);
+        RegDeleteKeyW(HKEY_LOCAL_MACHINE, keyPath);
+
+        // Also clean up old name
+        StringCchPrintfW(keyPath, ARRAYSIZE(keyPath),
             L"SOFTWARE\\Classes\\SystemFileAssociations\\%s\\shellex\\ContextMenuHandlers\\WinRARExtractTo",
             g_ArchiveExtensions[i]);
         RegDeleteKeyW(HKEY_LOCAL_MACHINE, keyPath);
     }
-    
+
+    // Remove all files handler
+    RegDeleteKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Classes\\*\\shellex\\ContextMenuHandlers\\WinRARShellExt");
+
+    // Remove directory handler
+    RegDeleteKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Classes\\Directory\\shellex\\ContextMenuHandlers\\WinRARShellExt");
+
     // Clean up old registrations
     RegDeleteKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Classes\\*\\shellex\\ContextMenuHandlers\\WinRAR~ExtractTo");
     RegDeleteKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Classes\\*\\shellex\\ContextMenuHandlers\\WinRARExtractTo");
     RegDeleteKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Classes\\*\\shellex\\ContextMenuHandlers\\~~~WinRARFlat");
     RegDeleteKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Classes\\*\\shellex\\ContextMenuHandlers\\WinRARFlat");
-    
+
     SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, NULL, NULL);
-    
+
     return S_OK;
 }
